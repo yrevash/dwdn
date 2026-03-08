@@ -173,7 +173,7 @@ def download_via_instagrapi(url: str, output_template_base: str) -> str | None:
         return None
     try:
         media_pk = _ig_client.media_pk_from_url(url)
-        info = _ig_client.media_info(media_pk)
+        info = _ig_client.media_info_v1(media_pk)  # private API, no 401s
         video_url = str(info.video_url)
         if not video_url:
             return None
