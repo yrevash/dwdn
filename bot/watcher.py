@@ -31,6 +31,9 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 # Session file to avoid re-login every restart
 SESSION_FILE = Path("session.json")
 
+# Cookies file for yt-dlp (generated from instagrapi session)
+COOKIES_FILE = Path("ig_cookies.txt")
+
 # Google Drive: rclone remote name + folder (set in .env)
 # e.g. GDRIVE_REMOTE=gdrive:Reels
 GDRIVE_REMOTE = os.getenv("GDRIVE_REMOTE", "")
@@ -88,6 +91,19 @@ def upload_to_drive(file_path: Path) -> bool:
         return False
 
 
+def write_cookies_file(cl: Client) -> None:
+    """Write instagrapi session cookies to Netscape format for yt-dlp."""
+    try:
+        cookies = cl.cookie_dict
+        lines = ["# Netscape HTTP Cookie File\n"]
+        for name, value in cookies.items():
+            lines.append(f".instagram.com\tTRUE\t/\tTRUE\t9999999999\t{name}\t{value}\n")
+        COOKIES_FILE.write_text("".join(lines))
+        log.info(f"Wrote {len(cookies)} cookies to {COOKIES_FILE}")
+    except Exception as e:
+        log.warning(f"Could not write cookies file: {e}")
+
+
 def download_video(url: str) -> bool:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -101,9 +117,13 @@ def download_video(url: str) -> bool:
         "--merge-output-format", "mp4",
         "-o", output_template,
         "--no-part",
-        "--print", "after_move:filepath",  # prints final file path
+        "--print", "after_move:filepath",
         url,
     ]
+
+    # Pass Instagram cookies if available
+    if COOKIES_FILE.exists():
+        cmd = cmd[:1] + ["--cookies", str(COOKIES_FILE)] + cmd[1:]
 
     log.info(f"Downloading: {url}")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -134,6 +154,7 @@ def login(cl: Client) -> None:
         try:
             cl.load_settings(SESSION_FILE)
             cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+            write_cookies_file(cl)
             log.info("Resumed session")
             return
         except Exception:
@@ -143,6 +164,7 @@ def login(cl: Client) -> None:
     log.info(f"Logging in as @{INSTAGRAM_USERNAME}...")
     cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
     cl.dump_settings(SESSION_FILE)
+    write_cookies_file(cl)
     log.info("Logged in and session saved")
 
 # ─── MAIN LOOP ─────────────────────────────────────────────────────────────────
