@@ -1,2 +1,3 @@
 instagrapi
 yt-dlp
+requests

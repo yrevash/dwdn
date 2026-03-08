@@ -15,6 +15,7 @@ import logging
 import hashlib
 import subprocess
 import threading
+import requests
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -161,6 +162,39 @@ def _run_ytdlp(url: str, fmt: str, output_template: str) -> subprocess.Completed
     ]
     return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
+IS_INSTAGRAM_URL = re.compile(r"instagram\.com/(?:reel|reels|p)/([A-Za-z0-9_-]+)")
+
+_ig_client: Client | None = None  # set in run()
+
+def download_via_instagrapi(url: str, output_template_base: str) -> str | None:
+    """Download an Instagram reel directly via instagrapi (no yt-dlp, no rate limits)."""
+    global _ig_client
+    if not _ig_client:
+        return None
+    try:
+        media_pk = _ig_client.media_pk_from_url(url)
+        info = _ig_client.media_info(media_pk)
+        video_url = str(info.video_url)
+        if not video_url:
+            return None
+
+        out_path = Path(output_template_base + ".mp4")
+        log.info(f"Direct CDN download: {video_url[:80]}...")
+
+        headers = {"User-Agent": "Instagram 269.0.0.18.75 Android"}
+        with requests.get(video_url, headers=headers, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 256):
+                    f.write(chunk)
+
+        log.info(f"Downloaded via instagrapi: {out_path.name}")
+        return str(out_path)
+    except Exception as e:
+        log.warning(f"instagrapi download failed: {e}, falling back to yt-dlp")
+        return None
+
+
 def download_video(url: str, downloaded_urls: set) -> bool:
     fp = url_fingerprint(url)
     if fp in downloaded_urls:
@@ -170,8 +204,20 @@ def download_video(url: str, downloaded_urls: set) -> bool:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_template = str(DOWNLOAD_DIR / f"{timestamp}_%(title).80s.%(ext)s")
+    output_base = str(DOWNLOAD_DIR / f"{timestamp}")
 
     log.info(f"Downloading: {url}")
+
+    # For Instagram URLs: use instagrapi directly — no yt-dlp, no rate limits
+    if IS_INSTAGRAM_URL.search(url):
+        output_path = download_via_instagrapi(url, output_base)
+        if output_path:
+            downloaded_urls.add(fp)
+            save_json_set(DOWNLOADED_FILE, downloaded_urls)
+            if GDRIVE_REMOTE:
+                upload_to_drive(Path(output_path))
+            return True
+        log.info("Falling back to yt-dlp for Instagram URL...")
 
     for attempt, fmt in enumerate(FORMATS, 1):
         try:
@@ -304,8 +350,10 @@ def run():
     if not IG_USERNAME or not IG_PASSWORD:
         raise RuntimeError("Set IG_USERNAME and IG_PASSWORD env vars")
 
+    global _ig_client
     cl = make_client()
     login(cl)
+    _ig_client = cl
 
     seen_ids       = load_json_set(SEEN_FILE)
     downloaded_urls = load_json_set(DOWNLOADED_FILE)
