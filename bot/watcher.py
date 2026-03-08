@@ -186,45 +186,70 @@ def run():
                     seen_message_ids.add(msg_id)
                     sender = getattr(msg, "user_id", "unknown")
 
-                    # Debug: log every new message so we can see what types arrive
-                    log.info(f"NEW MSG from {sender} | type={msg.item_type} | raw={str(msg)[:200]}")
+                    log.info(f"NEW MSG from {sender} | type={msg.item_type}")
 
                     # Check text messages for URLs
                     if msg.item_type == "text":
                         urls = extract_urls(msg.text or "")
                         for url in urls:
-                            log.info(f"New URL from {sender}: {url}")
+                            log.info(f"URL from {sender}: {url}")
                             download_video(url)
 
-                    # Check if someone shared a reel/clip directly
+                    # xma_clip = reel shared via DM (modern Instagram format)
+                    elif msg.item_type == "xma_clip":
+                        try:
+                            # Try xma_share dict first
+                            xma = getattr(msg, "xma_share", None)
+                            code = None
+                            if isinstance(xma, dict):
+                                code = xma.get("shortcode") or xma.get("code")
+                                if not code:
+                                    # Sometimes nested under target_url
+                                    target = xma.get("target_url", "")
+                                    codes = re.findall(r"/(?:reel|p)/([A-Za-z0-9_-]+)", target)
+                                    code = codes[0] if codes else None
+
+                            # Fallback: scan full string representation for a shortcode
+                            if not code:
+                                codes = re.findall(r"/(?:reel|reels|p)/([A-Za-z0-9_-]+)", str(msg))
+                                code = codes[0] if codes else None
+
+                            if code:
+                                url = f"https://www.instagram.com/reel/{code}/"
+                                log.info(f"xma_clip reel from {sender}: {url}")
+                                download_video(url)
+                            else:
+                                log.warning(f"xma_clip: could not extract code. raw={str(msg)[:400]}")
+                        except Exception as e:
+                            log.warning(f"xma_clip parse error: {e}")
+
+                    # Direct clip/media share
                     elif msg.item_type in ("clip", "media", "felix_share"):
-                        # Try to get the media URL from the share
                         try:
                             if hasattr(msg, "clip") and msg.clip:
                                 code = msg.clip.get("code") or msg.clip.get("pk")
                                 if code:
                                     url = f"https://www.instagram.com/reel/{code}/"
-                                    log.info(f"Shared reel from {sender}: {url}")
+                                    log.info(f"clip from {sender}: {url}")
                                     download_video(url)
                             elif hasattr(msg, "media_share") and msg.media_share:
-                                pk = msg.media_share.get("pk") or msg.media_share.get("id")
                                 code = msg.media_share.get("code")
                                 if code:
                                     url = f"https://www.instagram.com/p/{code}/"
-                                    log.info(f"Shared post from {sender}: {url}")
+                                    log.info(f"media_share from {sender}: {url}")
                                     download_video(url)
                         except Exception as e:
-                            log.warning(f"Could not parse shared media: {e}")
+                            log.warning(f"clip/media parse error: {e}")
 
                     # Link shares
                     elif msg.item_type == "link":
                         try:
                             link_url = msg.link.get("link_context", {}).get("link_url", "")
                             if link_url:
-                                log.info(f"Link from {sender}: {link_url}")
+                                log.info(f"link from {sender}: {link_url}")
                                 download_video(link_url)
                         except Exception as e:
-                            log.warning(f"Could not parse link: {e}")
+                            log.warning(f"link parse error: {e}")
 
         except LoginRequired:
             log.warning("Session expired, re-logging in...")
