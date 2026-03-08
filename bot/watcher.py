@@ -148,7 +148,10 @@ def _run_ytdlp(url: str, fmt: str, output_template: str) -> subprocess.Completed
         "--no-warnings",
         "--retries", "5",
         "--fragment-retries", "5",
-        "--retry-sleep", "3",
+        "--retry-sleep", "5",
+        "--sleep-requests", "2",     # 2s between API requests
+        "--sleep-interval", "3",     # 3s between downloads
+        "--max-sleep-interval", "8", # random up to 8s
         "-f", fmt,
         "--merge-output-format", "mp4",
         "-o", output_template,
