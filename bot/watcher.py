@@ -178,7 +178,8 @@ def download_via_instagrapi(url: str, output_template_base: str) -> str | None:
         if not video_url:
             return None
 
-        out_path = Path(output_template_base + ".mp4")
+        unique = str(media_pk)[-6:]  # last 6 digits of media PK = unique per reel
+        out_path = Path(output_template_base + f"_{unique}.mp4")
         log.info(f"Direct CDN download: {video_url[:80]}...")
 
         headers = {"User-Agent": "Instagram 269.0.0.18.75 Android"}
