@@ -371,6 +371,13 @@ def download_via_ytdlp(url: str, sender_username: str, downloaded_urls: set) -> 
 
 # ─── UNIFIED DOWNLOAD ENTRY ────────────────────────────────────────────────────
 
+def _safe_download(url: str, sender_id: str, downloaded_urls: set) -> None:
+    """Wrapper so any exception in a download task is logged and swallowed — never blocks the pool."""
+    try:
+        download_video(url, sender_id, downloaded_urls)
+    except Exception as e:
+        log.error(f"Download task crashed ({url}): {e}")
+
 def download_video(url: str, sender_id: str, downloaded_urls: set) -> bool:
     fp = url_fingerprint(url)
 
@@ -494,15 +501,8 @@ def run():
                         url = extract_url_from_msg(msg)
                         if url:
                             log.info(f"Queuing: {url}")
-                            fut = executor.submit(download_video, url, sender_id, downloaded_urls)
-                            futures.append(fut)
-                        # silently skip non-video messages (text without links, reactions, etc.)
-
-                for fut in as_completed(futures):
-                    try:
-                        fut.result()
-                    except Exception as e:
-                        log.error(f"Download error: {e}")
+                            # fire-and-forget: one failure never blocks others
+                            executor.submit(_safe_download, url, sender_id, downloaded_urls)
 
                 with _state_lock:
                     save_json_set(SEEN_FILE, seen_ids)
