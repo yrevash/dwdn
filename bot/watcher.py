@@ -22,7 +22,7 @@ from instagrapi.exceptions import LoginRequired, ChallengeRequired
 INSTAGRAM_USERNAME = os.getenv("IG_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("IG_PASSWORD", "")
 
-# Where downloaded videos are saved
+# Where downloaded videos are saved locally (temp staging)
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
 
 # How often to check DMs (seconds)
@@ -30,6 +30,13 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 
 # Session file to avoid re-login every restart
 SESSION_FILE = Path("session.json")
+
+# Google Drive: rclone remote name + folder (set in .env)
+# e.g. GDRIVE_REMOTE=gdrive:Reels
+GDRIVE_REMOTE = os.getenv("GDRIVE_REMOTE", "")
+
+# If True, delete local file after successful upload to Drive
+DELETE_AFTER_UPLOAD = os.getenv("DELETE_AFTER_UPLOAD", "true").lower() == "true"
 
 # ─── LOGGING ───────────────────────────────────────────────────────────────────
 
@@ -59,6 +66,28 @@ def extract_urls(text: str) -> list[str]:
 
 # ─── DOWNLOADER ────────────────────────────────────────────────────────────────
 
+def upload_to_drive(file_path: Path) -> bool:
+    """Upload a file to Google Drive via rclone."""
+    if not GDRIVE_REMOTE:
+        return False
+
+    log.info(f"Uploading to Drive ({GDRIVE_REMOTE}): {file_path.name}")
+    result = subprocess.run(
+        ["rclone", "copy", str(file_path), GDRIVE_REMOTE, "--progress"],
+        capture_output=True, text=True, timeout=300
+    )
+
+    if result.returncode == 0:
+        log.info(f"Uploaded to Drive: {file_path.name}")
+        if DELETE_AFTER_UPLOAD:
+            file_path.unlink(missing_ok=True)
+            log.info(f"Deleted local file: {file_path.name}")
+        return True
+    else:
+        log.error(f"rclone upload failed: {result.stderr[-300:]}")
+        return False
+
+
 def download_video(url: str) -> bool:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -72,6 +101,7 @@ def download_video(url: str) -> bool:
         "--merge-output-format", "mp4",
         "-o", output_template,
         "--no-part",
+        "--print", "after_move:filepath",  # prints final file path
         url,
     ]
 
@@ -79,7 +109,18 @@ def download_video(url: str) -> bool:
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
     if result.returncode == 0:
-        log.info(f"Downloaded successfully")
+        # Get the actual output file path from yt-dlp's print
+        output_path = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else None
+
+        log.info("Downloaded successfully")
+
+        if GDRIVE_REMOTE and output_path:
+            upload_to_drive(Path(output_path))
+        elif GDRIVE_REMOTE:
+            # Fallback: upload everything new in DOWNLOAD_DIR
+            for f in sorted(DOWNLOAD_DIR.glob(f"{timestamp}*.mp4")):
+                upload_to_drive(f)
+
         return True
     else:
         log.error(f"yt-dlp failed: {result.stderr[-300:]}")
