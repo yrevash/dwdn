@@ -122,7 +122,7 @@ export default function Home() {
         if (total > 0) setProgress(Math.round((received / total) * 100));
       }
 
-      const blob = new Blob(chunks, { type: "video/mp4" });
+      const blob = new Blob(chunks as BlobPart[], { type: "video/mp4" });
       const blobUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = blobUrl;
