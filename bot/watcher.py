@@ -186,6 +186,9 @@ def run():
                     seen_message_ids.add(msg_id)
                     sender = getattr(msg, "user_id", "unknown")
 
+                    # Debug: log every new message so we can see what types arrive
+                    log.info(f"NEW MSG from {sender} | type={msg.item_type} | raw={str(msg)[:200]}")
+
                     # Check text messages for URLs
                     if msg.item_type == "text":
                         urls = extract_urls(msg.text or "")
