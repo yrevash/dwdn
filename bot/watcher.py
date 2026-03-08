@@ -496,8 +496,7 @@ def run():
                             log.info(f"Queuing: {url}")
                             fut = executor.submit(download_video, url, sender_id, downloaded_urls)
                             futures.append(fut)
-                        else:
-                            log.info(f"No URL in {msg.item_type} message")
+                        # silently skip non-video messages (text without links, reactions, etc.)
 
                 for fut in as_completed(futures):
                     try:
