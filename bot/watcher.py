@@ -231,9 +231,37 @@ def download_via_instagrapi(url: str, sender_username: str, downloaded_urls: set
     try:
         media_pk = _ig_client.media_pk_from_url(url)
         info = _ig_client.media_info_v1(media_pk)
-        video_url = str(info.video_url) if info.video_url else ""
+
+        # Try multiple sources for the video URL
+        video_url = ""
+        if info.video_url:
+            video_url = str(info.video_url)
+        elif hasattr(info, "video_versions") and info.video_versions:
+            # Pick highest quality version
+            best = sorted(info.video_versions, key=lambda v: getattr(v, "width", 0) * getattr(v, "height", 0), reverse=True)
+            video_url = str(best[0].url) if best else ""
+        elif hasattr(info, "resources") and info.resources:
+            # Carousel — grab first video resource
+            for res in info.resources:
+                if getattr(res, "video_url", None):
+                    video_url = str(res.video_url)
+                    break
+
         if not video_url:
-            log.warning(f"No video_url for {url}")
+            log.warning(f"No video_url found for {url}, trying clip_download...")
+            try:
+                out = _ig_client.clip_download(media_pk, folder=DOWNLOAD_DIR)
+                out_path = Path(out) if out else None
+                if out_path and out_path.exists():
+                    log.info(f"clip_download: {out_path.name}")
+                    with _state_lock:
+                        downloaded_urls.add(fp)
+                        save_json_set(DOWNLOADED_FILE, downloaded_urls)
+                    if GDRIVE_REMOTE:
+                        upload_to_drive(out_path)
+                    return True
+            except Exception as e2:
+                log.warning(f"clip_download also failed: {e2}")
             return False
 
         # Get reel title/caption for filename
