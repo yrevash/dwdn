@@ -26,35 +26,6 @@ from instagrapi.exceptions import (
     ClientThrottledError,
 )
 
-# ─── MONKEY PATCH ──────────────────────────────────────────────────────────────
-# instagrapi's MediaXma model has video_url as a required HttpUrl field.
-# When Instagram sends video_url=None in DM message previews, pydantic's
-# compiled validators crash the entire inbox parsing. Fix: subclass with
-# Optional fields and replace the model in the module + rebuild dependents.
-try:
-    import pydantic
-    from instagrapi import types as _ig_types
-
-    class _PatchedMediaXma(_ig_types.MediaXma):
-        video_url: str | None = None
-        thumbnail_url: str | None = None
-
-    _ig_types.MediaXma = _PatchedMediaXma
-
-    # Rebuild every pydantic model in instagrapi.types so they pick up the patched class
-    for _name in dir(_ig_types):
-        _cls = getattr(_ig_types, _name, None)
-        if (
-            isinstance(_cls, type)
-            and issubclass(_cls, pydantic.BaseModel)
-            and _cls is not _PatchedMediaXma
-        ):
-            try:
-                _cls.model_rebuild(force=True)
-            except Exception:
-                pass
-except Exception as _e:
-    pass  # if patch fails, we still have try/except fallbacks everywhere
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 
@@ -153,6 +124,84 @@ def get_username(user_id: str) -> str:
         save_json_dict(USERNAME_CACHE_FILE, _username_cache)
 
     return username
+
+# ─── RAW DM FETCHING (bypasses pydantic models entirely) ──────────────────────
+
+def fetch_threads_raw(cl: Client) -> list[dict]:
+    """Fetch DM threads via raw API — no pydantic, no crashes."""
+    try:
+        resp = cl.private_request("direct_v2/inbox/", params={
+            "visual_message_return_type": "unseen",
+            "thread_message_limit": "10",
+            "persistentBadging": "true",
+            "limit": "20",
+            "is_prefetching": "false",
+        })
+        return resp.get("inbox", {}).get("threads", [])
+    except Exception as e:
+        log.warning(f"Failed to fetch inbox: {e}")
+        return []
+
+def fetch_messages_raw(cl: Client, thread_id: str) -> list[dict]:
+    """Fetch messages for a thread via raw API — no pydantic, no crashes."""
+    try:
+        resp = cl.private_request(f"direct_v2/threads/{thread_id}/", params={
+            "visual_message_return_type": "unseen",
+            "direction": "older",
+            "limit": "20",
+        })
+        return resp.get("thread", {}).get("items", [])
+    except Exception as e:
+        log.warning(f"Failed to fetch thread {thread_id}: {e}")
+        return []
+
+def extract_url_from_raw_item(item: dict) -> str | None:
+    """Extract downloadable URL from a raw DM message dict."""
+    try:
+        item_type = item.get("item_type", "")
+
+        # Text message with URL
+        if item_type == "text":
+            return (extract_urls(item.get("text", "")) or [None])[0]
+
+        # Reel/clip share (xma_clip, xma_media_share)
+        if item_type in ("xma_clip", "xma_media_share", "xma_link"):
+            # Try xma_media_share list
+            for xma in item.get("xma_media_share", []):
+                code = reel_code_from_str(xma.get("target_url", "") or xma.get("preview_url", ""))
+                if code:
+                    return f"https://www.instagram.com/reel/{code}/"
+            # Scan the whole item string for shortcodes
+            code = reel_code_from_str(json.dumps(item))
+            if code:
+                return f"https://www.instagram.com/reel/{code}/"
+            return None
+
+        # Direct clip share
+        if item_type in ("clip", "felix_share"):
+            clip = item.get("clip", {}).get("clip", {})
+            code = clip.get("code")
+            if code:
+                return f"https://www.instagram.com/reel/{code}/"
+            code = reel_code_from_str(json.dumps(item))
+            if code:
+                return f"https://www.instagram.com/reel/{code}/"
+
+        # Media share (photo/video post)
+        if item_type == "media_share":
+            code = item.get("media_share", {}).get("code")
+            if code:
+                return f"https://www.instagram.com/p/{code}/"
+
+        # Link
+        if item_type == "link":
+            link_url = item.get("link", {}).get("link_context", {}).get("link_url", "")
+            return link_url or None
+
+    except Exception as e:
+        log.warning(f"URL extract error: {e}")
+
+    return None
 
 # ─── URL HELPERS ───────────────────────────────────────────────────────────────
 
@@ -427,54 +476,6 @@ def download_video(url: str, sender_id: str, downloaded_urls: set) -> bool:
 
     return download_via_ytdlp(url, sender_username, downloaded_urls)
 
-# ─── MESSAGE PARSING ───────────────────────────────────────────────────────────
-
-def extract_url_from_msg(msg) -> str | None:
-    t = msg.item_type
-
-    if t == "text":
-        urls = extract_urls(msg.text or "")
-        return urls[0] if urls else None
-
-    if t in ("xma_clip", "xma_media_share", "xma_link"):
-        xma = getattr(msg, "xma_share", None)
-        if isinstance(xma, dict):
-            code = xma.get("shortcode") or xma.get("code")
-            if not code:
-                target = xma.get("target_url", "") or xma.get("url", "")
-                code = reel_code_from_str(target)
-            if code:
-                return f"https://www.instagram.com/reel/{code}/"
-        code = reel_code_from_str(str(msg))
-        if code:
-            return f"https://www.instagram.com/reel/{code}/"
-        urls = [u for u in extract_urls(str(msg)) if "instagram.com" in u]
-        return urls[0] if urls else None
-
-    if t in ("clip", "felix_share"):
-        clip = getattr(msg, "clip", None)
-        if isinstance(clip, dict):
-            code = clip.get("code") or reel_code_from_str(str(clip))
-            if code:
-                return f"https://www.instagram.com/reel/{code}/"
-
-    if t == "media_share":
-        ms = getattr(msg, "media_share", None)
-        if isinstance(ms, dict):
-            code = ms.get("code")
-            if code:
-                return f"https://www.instagram.com/p/{code}/"
-
-    if t == "link":
-        try:
-            link = getattr(msg, "link", {}) or {}
-            url = link.get("link_context", {}).get("link_url", "")
-            return url or None
-        except Exception:
-            pass
-
-    return None
-
 # ─── MAIN LOOP ─────────────────────────────────────────────────────────────────
 
 def run():
@@ -496,16 +497,16 @@ def run():
 
     log.info("Seeding existing messages...")
     try:
-        threads = cl.direct_threads(amount=20)
-        for thread in threads:
-            try:
-                msgs = cl.direct_messages(thread.id, amount=20)
-                for m in msgs:
-                    seen_ids.add(str(m.id))
-            except Exception as te:
-                # Some threads have malformed messages (video_url=None etc.)
-                # Seed the thread ID so we don't retry, then continue
-                log.warning(f"Skipping thread {thread.id} during seed: {str(te)[:100]}")
+        raw_threads = fetch_threads_raw(cl)
+        for rt in raw_threads:
+            tid = rt.get("thread_id", "")
+            if not tid:
+                continue
+            raw_msgs = fetch_messages_raw(cl, tid)
+            for item in raw_msgs:
+                mid = item.get("item_id", "")
+                if mid:
+                    seen_ids.add(str(mid))
         save_json_set(SEEN_FILE, seen_ids)
         log.info(f"Seeded {len(seen_ids)} messages — watching for new ones")
     except Exception as e:
@@ -517,32 +518,29 @@ def run():
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         while not _shutdown.is_set():
             try:
-                threads = cl.direct_threads(amount=20)
-                futures = []
+                raw_threads = fetch_threads_raw(cl)
 
-                for thread in threads:
-                    try:
-                        msgs = cl.direct_messages(thread.id, amount=10)
-                    except Exception as te:
-                        log.warning(f"Skipping thread {thread.id}: {str(te)[:100]}")
+                for rt in raw_threads:
+                    tid = rt.get("thread_id", "")
+                    if not tid:
                         continue
 
-                    for msg in msgs:
-                        mid = str(msg.id)
+                    raw_msgs = fetch_messages_raw(cl, tid)
+                    for item in raw_msgs:
+                        mid = str(item.get("item_id", ""))
+                        if not mid:
+                            continue
 
                         with _state_lock:
                             if mid in seen_ids:
                                 continue
                             seen_ids.add(mid)
 
-                        sender_id = str(getattr(msg, "user_id", "0"))
-                        log.info(f"NEW MSG from {sender_id} | type={msg.item_type}")
+                        sender_id = str(item.get("user_id", "0"))
+                        item_type = item.get("item_type", "?")
+                        log.info(f"NEW MSG from {sender_id} | type={item_type}")
 
-                        try:
-                            url = extract_url_from_msg(msg)
-                        except Exception:
-                            url = None
-
+                        url = extract_url_from_raw_item(item)
                         if url:
                             log.info(f"Queuing: {url}")
                             executor.submit(_safe_download, url, sender_id, downloaded_urls)
