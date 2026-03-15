@@ -27,25 +27,33 @@ from instagrapi.exceptions import (
 )
 
 # ─── MONKEY PATCH ──────────────────────────────────────────────────────────────
-# instagrapi's MediaXma model has video_url as a required URL field.
-# When Instagram sends video_url=None in DM message previews, the whole
-# inbox parsing crashes with a pydantic ValidationError. Patch it to accept None.
+# instagrapi's MediaXma model has video_url as a required HttpUrl field.
+# When Instagram sends video_url=None in DM message previews, pydantic's
+# compiled validators crash the entire inbox parsing. Fix: subclass with
+# Optional fields and replace the model in the module + rebuild dependents.
 try:
-    from typing import Optional
+    import pydantic
     from instagrapi import types as _ig_types
-    _models_to_patch = ["MediaXma"]
-    _fields_to_patch = ["video_url", "thumbnail_url"]
-    for _model_name in _models_to_patch:
-        _model = getattr(_ig_types, _model_name, None)
-        if _model and hasattr(_model, "__annotations__"):
-            _changed = False
-            for _field in _fields_to_patch:
-                if _field in _model.__annotations__:
-                    _model.__annotations__[_field] = Optional[str]
-                    _changed = True
-            if _changed:
-                _model.model_rebuild(force=True)
-except Exception:
+
+    class _PatchedMediaXma(_ig_types.MediaXma):
+        video_url: str | None = None
+        thumbnail_url: str | None = None
+
+    _ig_types.MediaXma = _PatchedMediaXma
+
+    # Rebuild every pydantic model in instagrapi.types so they pick up the patched class
+    for _name in dir(_ig_types):
+        _cls = getattr(_ig_types, _name, None)
+        if (
+            isinstance(_cls, type)
+            and issubclass(_cls, pydantic.BaseModel)
+            and _cls is not _PatchedMediaXma
+        ):
+            try:
+                _cls.model_rebuild(force=True)
+            except Exception:
+                pass
+except Exception as _e:
     pass  # if patch fails, we still have try/except fallbacks everywhere
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
