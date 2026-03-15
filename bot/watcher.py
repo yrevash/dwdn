@@ -26,6 +26,28 @@ from instagrapi.exceptions import (
     ClientThrottledError,
 )
 
+# ─── MONKEY PATCH ──────────────────────────────────────────────────────────────
+# instagrapi's MediaXma model has video_url as a required URL field.
+# When Instagram sends video_url=None in DM message previews, the whole
+# inbox parsing crashes with a pydantic ValidationError. Patch it to accept None.
+try:
+    from typing import Optional
+    from instagrapi import types as _ig_types
+    _models_to_patch = ["MediaXma"]
+    _fields_to_patch = ["video_url", "thumbnail_url"]
+    for _model_name in _models_to_patch:
+        _model = getattr(_ig_types, _model_name, None)
+        if _model and hasattr(_model, "__annotations__"):
+            _changed = False
+            for _field in _fields_to_patch:
+                if _field in _model.__annotations__:
+                    _model.__annotations__[_field] = Optional[str]
+                    _changed = True
+            if _changed:
+                _model.model_rebuild(force=True)
+except Exception:
+    pass  # if patch fails, we still have try/except fallbacks everywhere
+
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 
 IG_USERNAME         = os.getenv("IG_USERNAME", "")
