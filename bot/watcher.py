@@ -468,9 +468,14 @@ def run():
     try:
         threads = cl.direct_threads(amount=20)
         for thread in threads:
-            msgs = cl.direct_messages(thread.id, amount=20)
-            for m in msgs:
-                seen_ids.add(str(m.id))
+            try:
+                msgs = cl.direct_messages(thread.id, amount=20)
+                for m in msgs:
+                    seen_ids.add(str(m.id))
+            except Exception as te:
+                # Some threads have malformed messages (video_url=None etc.)
+                # Seed the thread ID so we don't retry, then continue
+                log.warning(f"Skipping thread {thread.id} during seed: {str(te)[:100]}")
         save_json_set(SEEN_FILE, seen_ids)
         log.info(f"Seeded {len(seen_ids)} messages — watching for new ones")
     except Exception as e:
@@ -486,7 +491,12 @@ def run():
                 futures = []
 
                 for thread in threads:
-                    msgs = cl.direct_messages(thread.id, amount=10)
+                    try:
+                        msgs = cl.direct_messages(thread.id, amount=10)
+                    except Exception as te:
+                        log.warning(f"Skipping thread {thread.id}: {str(te)[:100]}")
+                        continue
+
                     for msg in msgs:
                         mid = str(msg.id)
 
@@ -498,10 +508,13 @@ def run():
                         sender_id = str(getattr(msg, "user_id", "0"))
                         log.info(f"NEW MSG from {sender_id} | type={msg.item_type}")
 
-                        url = extract_url_from_msg(msg)
+                        try:
+                            url = extract_url_from_msg(msg)
+                        except Exception:
+                            url = None
+
                         if url:
                             log.info(f"Queuing: {url}")
-                            # fire-and-forget: one failure never blocks others
                             executor.submit(_safe_download, url, sender_id, downloaded_urls)
 
                 with _state_lock:
