@@ -159,7 +159,8 @@ def run_apify_scraper(shutdown) -> None:
 
         up = sk = fa = 0
         interrupted = False
-        for item in pending:
+        total = len(pending)
+        for i, item in enumerate(pending, 1):
             if shutdown.is_set():
                 interrupted = True
                 break
@@ -171,6 +172,9 @@ def run_apify_scraper(shutdown) -> None:
             up += res == "uploaded"
             sk += res == "skip"
             fa += res == "fail"
+            if i % 10 == 0 or i == total:
+                log.info(f"Apify progress: {i}/{total}  ({up} uploaded, {sk} dupes, {fa} failed, "
+                         f"{total - i} left)")
 
         if interrupted:
             log.info(f"Stopped mid-batch — {PENDING_FILE} kept; will resume on restart (no re-charge)")
