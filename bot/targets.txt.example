@@ -1,0 +1,8 @@
+# Accounts to auto-scrape — one username per line.
+# Lines starting with '#' and blank lines are ignored.
+# Bare handle, @handle, or a full profile URL all work.
+#
+# Copy this file to targets.txt and edit. In Docker, put targets.txt in the
+# mounted state/ folder (state/targets.txt) so you can edit it without rebuilding.
+
+bhajanmarg_official

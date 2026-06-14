@@ -1,0 +1,15 @@
+# secrets + runtime state — NEVER commit
+.env
+state/
+downloads/
+session.json
+seen_ids.json
+downloaded_urls.json
+username_cache.json
+manifest.jsonl
+scrape_state.json
+targets.txt
+ig_cookies.txt
+__pycache__/
+*.pyc
+.venv/

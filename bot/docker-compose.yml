@@ -1,0 +1,10 @@
+services:
+  reel-bot:
+    build: .
+    container_name: ig-reel-r2
+    restart: always
+    env_file: .env
+    volumes:
+      # session.json + dedup/manifest/temp files persist here across restarts.
+      # Put your pre-generated session.json at ./state/session.json before first run.
+      - ./state:/app/state

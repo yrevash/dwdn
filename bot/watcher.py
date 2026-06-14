@@ -1,23 +1,37 @@
 #!/usr/bin/env python3
 """
-Instagram DM Watcher — Battle-hardened v3
-Fixes: sender username in filename, thread-safe state, unique filenames,
-       rclone checksum errors, username cache, locked dedup set.
+Instagram DM Watcher → Cloudflare R2
+
+Watches the @gv_reeldb account's DMs, downloads any reel sent to it, transcodes
+it to visually-transparent HEVC, and uploads the mp4 to a SCOPED R2 inbox
+bucket. Does one thing only — no web app, no API, no database.
+
+Forked from the battle-hardened Google-Drive watcher; storage swapped to R2,
+yt-dlp / rclone / cookies removed, HEVC transcode added.
 """
 
 import os
+
+# Load .env (if present) BEFORE anything reads os.environ — including the r2 /
+# transcode modules, which read their config at import time. Harmless in Docker,
+# where compose injects the environment and no .env file is present.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 import re
 import time
 import json
 import signal
 import logging
 import hashlib
-import subprocess
 import threading
 import requests
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 from instagrapi import Client
 from instagrapi.exceptions import (
@@ -26,21 +40,26 @@ from instagrapi.exceptions import (
     ClientThrottledError,
 )
 
+import r2
+import transcode
+import scraper
+
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 
-IG_USERNAME         = os.getenv("IG_USERNAME", "")
-IG_PASSWORD         = os.getenv("IG_PASSWORD", "")
-DOWNLOAD_DIR        = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
-POLL_INTERVAL       = int(os.getenv("POLL_INTERVAL", "30"))
-GDRIVE_REMOTE       = os.getenv("GDRIVE_REMOTE", "")
-DELETE_AFTER_UPLOAD = os.getenv("DELETE_AFTER_UPLOAD", "true").lower() == "true"
-MAX_WORKERS         = int(os.getenv("MAX_WORKERS", "3"))
+IG_USERNAME   = os.getenv("IG_USERNAME", "")
+IG_PASSWORD   = os.getenv("IG_PASSWORD", "")
+IG_PROXY      = os.getenv("IG_PROXY", "")
+IG_TOTP_SEED  = os.getenv("IG_TOTP_SEED", "")   # authenticator-app secret → auto 2FA codes
+IG_2FA_CODE   = os.getenv("IG_2FA_CODE", "")    # one-time 6-digit code (first-login fallback)
+DOWNLOAD_DIR  = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
+MAX_WORKERS   = int(os.getenv("MAX_WORKERS", "3"))
+DOWNLOAD_MIN_GAP = float(os.getenv("DOWNLOAD_MIN_GAP", "8"))  # min secs between download starts (anti-flag)
 
-SESSION_FILE    = Path("session.json")
-COOKIES_FILE    = Path("ig_cookies.txt")
-SEEN_FILE       = Path("seen_ids.json")
-DOWNLOADED_FILE = Path("downloaded_urls.json")
+SESSION_FILE        = Path("session.json")
+SEEN_FILE           = Path("seen_ids.json")
+DOWNLOADED_FILE     = Path("downloaded_urls.json")
 USERNAME_CACHE_FILE = Path("username_cache.json")
 
 # ─── LOGGING ───────────────────────────────────────────────────────────────────
@@ -225,91 +244,144 @@ def make_filename(sender_username: str, label: str, unique_id: str) -> str:
     label = sanitize(label)[:50]
     return f"{ts}_{sender_username}_{label}_{unique_id}.mp4"
 
-# ─── COOKIES ───────────────────────────────────────────────────────────────────
-
-def write_cookies(cl: Client) -> None:
-    try:
-        cookies = cl.cookie_dict
-        if not cookies:
-            return
-        lines = ["# Netscape HTTP Cookie File\n"]
-        for name, value in cookies.items():
-            lines.append(f".instagram.com\tTRUE\t/\tTRUE\t9999999999\t{name}\t{value}\n")
-        COOKIES_FILE.write_text("".join(lines))
-        log.info(f"Cookies updated ({len(cookies)} entries)")
-    except Exception as e:
-        log.warning(f"Cookie write failed: {e}")
-
 # ─── INSTAGRAM LOGIN ───────────────────────────────────────────────────────────
 
 def make_client() -> Client:
     cl = Client()
     cl.delay_range = [3, 7]
+    if IG_PROXY:
+        try:
+            cl.set_proxy(IG_PROXY)
+            log.info("Using IG_PROXY for Instagram traffic")
+        except Exception as e:
+            log.warning(f"set_proxy failed: {e}")
     return cl
+
+def _login_with_2fa(cl: Client) -> None:
+    """cl.login, supplying a 2FA code when the account needs one.
+
+    Prefers a TOTP seed (authenticator-app secret) so headless re-logins work
+    forever; falls back to a one-time IG_2FA_CODE for a first manual login.
+    """
+    code = ""
+    if IG_TOTP_SEED:
+        try:
+            code = cl.totp_generate_code(IG_TOTP_SEED)
+        except Exception as e:
+            log.warning(f"TOTP code generation failed: {e}")
+    elif IG_2FA_CODE:
+        code = IG_2FA_CODE
+
+    if code:
+        cl.login(IG_USERNAME, IG_PASSWORD, verification_code=code)
+    else:
+        cl.login(IG_USERNAME, IG_PASSWORD)
 
 def login(cl: Client) -> None:
     if SESSION_FILE.exists():
         log.info("Loading saved session...")
         try:
             cl.load_settings(SESSION_FILE)
-            cl.login(IG_USERNAME, IG_PASSWORD)
-            write_cookies(cl)
-            log.info("Session resumed")
-            return
+            if cl.user_id:
+                # Trust the loaded session — do NOT probe with a private-API call
+                # here. A browser-minted session can read media (scraping) while
+                # still failing strict endpoints like timeline_feed, and a cold
+                # login fallback would just re-trigger the device checkpoint.
+                # Individual operations handle their own failures.
+                log.info(f"Session resumed (user_id={cl.user_id})")
+                return
+            log.warning("Session has no user_id; falling back to a full login...")
         except Exception as e:
-            log.warning(f"Saved session failed ({e}), fresh login...")
-            SESSION_FILE.unlink(missing_ok=True)
+            log.warning(f"Could not load session ({e}); falling back to a full login...")
 
     log.info(f"Logging in as @{IG_USERNAME}...")
-    cl.login(IG_USERNAME, IG_PASSWORD)
+    _login_with_2fa(cl)
     cl.dump_settings(SESSION_FILE)
-    write_cookies(cl)
     log.info("Logged in — session saved")
 
-# ─── GOOGLE DRIVE UPLOAD ───────────────────────────────────────────────────────
+# ─── TRANSCODE + R2 UPLOAD + MANIFEST ──────────────────────────────────────────
 
-def upload_to_drive(file_path: Path, retries: int = 3) -> bool:
-    if not GDRIVE_REMOTE or not file_path.exists():
+def _finalize(local_path: Path, sender_username: str, caption: str,
+              shortcode: str, media_pk, origin: str = "dm") -> bool:
+    """Transcode → upload to R2 → append manifest → clean up local files.
+
+    Returns True only if the object actually landed in R2.
+    """
+    final_path, codec, src_bytes, out_bytes = transcode.transcode_hevc(local_path)
+
+    label = caption or "reel"
+    uid = shortcode or str(media_pk)[-8:]
+    filename = make_filename(sender_username, label, uid)
+
+    key = r2.upload(final_path, filename)
+
+    # Clean up local files (original + transcoded copy if they differ)
+    for p in {local_path, final_path}:
+        try:
+            Path(p).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if not key:
         return False
 
-    log.info(f"Uploading to Drive: {file_path.name}")
+    r2.append_manifest({
+        "key": key,
+        "origin": origin,            # "dm" (you sent it) or "scrape" (auto-pulled)
+        "sender": sender_username,   # DM sender, or the source account for scrapes
+        "caption": caption,
+        "shortcode": shortcode,
+        "media_pk": str(media_pk),
+        "codec": codec,
+        "src_bytes": src_bytes,
+        "out_bytes": out_bytes,
+        "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    })
+    return True
 
-    for attempt in range(1, retries + 1):
-        result = subprocess.run(
-            [
-                "rclone", "copy",
-                str(file_path), GDRIVE_REMOTE,
-                "--ignore-checksum",   # avoids md5 mismatch false failures
-                "--transfers", "1",
-            ],
-            capture_output=True, text=True, timeout=600
-        )
-        if result.returncode == 0:
-            log.info(f"Uploaded: {file_path.name}")
-            if DELETE_AFTER_UPLOAD:
-                file_path.unlink(missing_ok=True)
-                log.info(f"Deleted local: {file_path.name}")
-            return True
+# ─── DOWNLOAD THROTTLE (anti-flag) ─────────────────────────────────────────────
 
-        log.warning(f"rclone attempt {attempt}/{retries} failed: {result.stderr[-200:]}")
-        if attempt < retries:
-            time.sleep(10 * attempt)
+_dl_gate_lock = threading.Lock()
+_last_dl_start = 0.0
 
-    log.error(f"Upload failed after {retries} attempts: {file_path.name}")
-    return False
+def _throttle_download() -> None:
+    """Start at most one new download every DOWNLOAD_MIN_GAP seconds, no matter
+    how many the scraper queues — the real 'not all at once' guarantee that keeps
+    Instagram from flagging the account during big backfills. Already-downloaded
+    reels are skipped before reaching here, so they don't consume gate time."""
+    global _last_dl_start
+    with _dl_gate_lock:
+        now = time.monotonic()
+        wait = _last_dl_start + DOWNLOAD_MIN_GAP - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        _last_dl_start = now
 
 # ─── INSTAGRAPI DIRECT DOWNLOAD ────────────────────────────────────────────────
 
-def download_via_instagrapi(url: str, sender_username: str, downloaded_urls: set) -> bool:
+def download_via_instagrapi(url: str, sender_username: str, downloaded_urls: set,
+                            origin: str = "dm") -> bool:
     global _ig_client
     if not _ig_client:
         return False
 
+    _throttle_download()
+
     fp = url_fingerprint(url)
+    shortcode = reel_code_from_str(url) or ""
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
         media_pk = _ig_client.media_pk_from_url(url)
         info = _ig_client.media_info_v1(media_pk)
+
+        # Get reel caption for the filename/manifest
+        caption = ""
+        try:
+            caption = (info.caption_text or "").split("\n")[0][:50]
+        except Exception:
+            pass
 
         # Try multiple sources for the video URL
         video_url = ""
@@ -326,127 +398,49 @@ def download_via_instagrapi(url: str, sender_username: str, downloaded_urls: set
                     video_url = str(res.video_url)
                     break
 
+        # Fallback: instagrapi clip_download (still no yt-dlp)
         if not video_url:
             log.warning(f"No video_url found for {url}, trying clip_download...")
             try:
                 out = _ig_client.clip_download(media_pk, folder=DOWNLOAD_DIR)
                 out_path = Path(out) if out else None
-                if out_path and out_path.exists():
-                    log.info(f"clip_download: {out_path.name}")
-                    with _state_lock:
-                        downloaded_urls.add(fp)
-                        save_json_set(DOWNLOADED_FILE, downloaded_urls)
-                    if GDRIVE_REMOTE:
-                        upload_to_drive(out_path)
-                    return True
             except Exception as e2:
                 log.warning(f"clip_download also failed: {e2}")
-            return False
+                return False
+            if not (out_path and out_path.exists()):
+                log.warning(f"clip_download produced nothing for {url}")
+                return False
+            ok = _finalize(out_path, sender_username, caption, shortcode, media_pk, origin)
+            if ok:
+                with _state_lock:
+                    downloaded_urls.add(fp)
+                    save_json_set(DOWNLOADED_FILE, downloaded_urls)
+            return ok
 
-        # Get reel title/caption for filename
-        caption = ""
-        try:
-            caption = (info.caption_text or "").split("\n")[0][:50]
-        except Exception:
-            pass
-
-        filename = make_filename(sender_username, caption or "reel", str(media_pk)[-8:])
-        out_path = DOWNLOAD_DIR / filename
-        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-        log.info(f"CDN download → {filename}")
+        # Stream from the Instagram CDN to a temp file
+        tmp_path = DOWNLOAD_DIR / f"dl_{media_pk}.mp4"
+        log.info(f"CDN download → {tmp_path.name}")
         headers = {"User-Agent": "Instagram 269.0.0.18.75 Android"}
 
         with requests.get(video_url, headers=headers, stream=True, timeout=120) as r:
             r.raise_for_status()
-            with open(out_path, "wb") as f:
+            with open(tmp_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=256 * 1024):
                     if chunk:
                         f.write(chunk)
 
-        log.info(f"Downloaded: {filename}")
+        log.info(f"Downloaded: {tmp_path.name}")
 
-        with _state_lock:
-            downloaded_urls.add(fp)
-            save_json_set(DOWNLOADED_FILE, downloaded_urls)
-
-        if GDRIVE_REMOTE:
-            upload_to_drive(out_path)
-
-        return True
+        ok = _finalize(tmp_path, sender_username, caption, shortcode, media_pk, origin)
+        if ok:
+            with _state_lock:
+                downloaded_urls.add(fp)
+                save_json_set(DOWNLOADED_FILE, downloaded_urls)
+        return ok
 
     except Exception as e:
         log.warning(f"instagrapi download failed: {e}")
         return False
-
-# ─── YT-DLP DOWNLOAD (non-Instagram) ──────────────────────────────────────────
-
-FORMATS = [
-    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio",
-    "best[ext=mp4]/best",
-]
-
-def download_via_ytdlp(url: str, sender_username: str, downloaded_urls: set) -> bool:
-    fp = url_fingerprint(url)
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Unique output template per sender + time
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    uid = hashlib.md5(url.encode()).hexdigest()[:8]
-    output_template = str(DOWNLOAD_DIR / f"{ts}_{sender_username}_%(title).50s_{uid}.%(ext)s")
-
-    for attempt, fmt in enumerate(FORMATS, 1):
-        cmd = ["yt-dlp"]
-        if COOKIES_FILE.exists():
-            cmd += ["--cookies", str(COOKIES_FILE)]
-        cmd += [
-            "--no-playlist", "--no-warnings",
-            "--retries", "5",
-            "--fragment-retries", "5",
-            "--retry-sleep", "5",
-            "--sleep-requests", "2",
-            "--sleep-interval", "3",
-            "--max-sleep-interval", "8",
-            "-f", fmt,
-            "--merge-output-format", "mp4",
-            "-o", output_template,
-            "--no-part",
-            "--print", "after_move:filepath",
-            url,
-        ]
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-
-            if result.returncode == 0:
-                output_path = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else None
-                log.info(f"yt-dlp downloaded: {Path(output_path).name if output_path else 'ok'}")
-
-                with _state_lock:
-                    downloaded_urls.add(fp)
-                    save_json_set(DOWNLOADED_FILE, downloaded_urls)
-
-                if GDRIVE_REMOTE and output_path and Path(output_path).exists():
-                    upload_to_drive(Path(output_path))
-
-                return True
-
-            stderr = result.stderr[-500:]
-            if "rate-limit" in stderr.lower() or "429" in stderr:
-                log.warning(f"yt-dlp rate limited — waiting 60s (attempt {attempt})")
-                time.sleep(60)
-            elif "login required" in stderr.lower() or "cookies" in stderr.lower():
-                log.warning(f"yt-dlp auth error (attempt {attempt})")
-            else:
-                log.error(f"yt-dlp failed (attempt {attempt}): {stderr[-200:]}")
-
-        except subprocess.TimeoutExpired:
-            log.error(f"yt-dlp timed out (attempt {attempt})")
-        except Exception as e:
-            log.error(f"yt-dlp error (attempt {attempt}): {e}")
-
-    log.error(f"All download attempts failed: {url}")
-    return False
 
 # ─── UNIFIED DOWNLOAD ENTRY ────────────────────────────────────────────────────
 
@@ -465,22 +459,90 @@ def download_video(url: str, sender_id: str, downloaded_urls: set) -> bool:
             log.info(f"Already downloaded, skipping: {url}")
             return True
 
+    # Instagram-only: ignore anything that isn't a reel/post link
+    if not IS_INSTAGRAM_URL.search(url):
+        log.info(f"Not an Instagram reel/post URL, skipping: {url}")
+        return False
+
     sender_username = get_username(sender_id)
     log.info(f"Downloading [{sender_username}]: {url}")
+    return download_via_instagrapi(url, sender_username, downloaded_urls)
 
-    if IS_INSTAGRAM_URL.search(url):
-        ok = download_via_instagrapi(url, sender_username, downloaded_urls)
-        if ok:
-            return True
-        log.info("Falling back to yt-dlp...")
+def _safe_scrape_download(media, source_username: str, downloaded_urls: set) -> None:
+    """Wrapper for scraper-queued downloads — one failure never blocks the pool."""
+    try:
+        download_from_media(media, source_username, downloaded_urls)
+    except Exception as e:
+        log.error(f"Scrape download crashed: {e}")
 
-    return download_via_ytdlp(url, sender_username, downloaded_urls)
+def download_from_media(media, source_username: str, downloaded_urls: set) -> bool:
+    """Download a reel straight from a listing media object's video_url (origin =
+    scrape). Avoids media_info_v1, which a browser-grade session can't call."""
+    code = getattr(media, "code", "") or ""
+    url = f"https://www.instagram.com/reel/{code}/" if code else ""
+    fp = url_fingerprint(url) if url else None
+
+    if fp is not None:
+        with _state_lock:
+            if fp in downloaded_urls:
+                return True
+
+    # Video URL straight from the listing — no extra API call needed.
+    video_url = ""
+    if getattr(media, "video_url", None):
+        video_url = str(media.video_url)
+    elif getattr(media, "video_versions", None):
+        best = sorted(media.video_versions,
+                      key=lambda v: getattr(v, "width", 0) * getattr(v, "height", 0),
+                      reverse=True)
+        video_url = str(best[0].url) if best else ""
+    if not video_url:
+        log.warning(f"[scrape] no video_url for {code or 'media'}")
+        return False
+
+    _throttle_download()
+
+    caption = ""
+    try:
+        caption = (getattr(media, "caption_text", "") or "").split("\n")[0][:50]
+    except Exception:
+        pass
+
+    pk = getattr(media, "pk", "") or code
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = DOWNLOAD_DIR / f"scrape_{pk}.mp4"
+    log.info(f"[scrape] download → {tmp_path.name} (@{source_username})")
+
+    headers = {"User-Agent": "Instagram 269.0.0.18.75 Android"}
+    try:
+        with requests.get(video_url, headers=headers, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=256 * 1024):
+                    if chunk:
+                        f.write(chunk)
+    except Exception as e:
+        log.warning(f"[scrape] download failed for {code}: {e}")
+        tmp_path.unlink(missing_ok=True)
+        return False
+
+    ok = _finalize(tmp_path, sanitize(source_username), caption, code, pk, origin="scrape")
+    if ok and fp is not None:
+        with _state_lock:
+            downloaded_urls.add(fp)
+            save_json_set(DOWNLOADED_FILE, downloaded_urls)
+    return ok
 
 # ─── MAIN LOOP ─────────────────────────────────────────────────────────────────
 
 def run():
     if not IG_USERNAME or not IG_PASSWORD:
         raise RuntimeError("Set IG_USERNAME and IG_PASSWORD env vars")
+    if not r2.is_configured():
+        raise RuntimeError(
+            "R2 not configured — set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, "
+            "R2_SECRET_ACCESS_KEY, R2_BUCKET"
+        )
 
     global _ig_client, _username_cache
 
@@ -493,7 +555,8 @@ def run():
     _username_cache = load_json_dict(USERNAME_CACHE_FILE)
 
     log.info(f"Loaded {len(seen_ids)} seen IDs, {len(downloaded_urls)} downloaded, {len(_username_cache)} cached usernames")
-    log.info(f"Polling every {POLL_INTERVAL}s — saving to {DOWNLOAD_DIR.resolve()}")
+    log.info(f"Polling every {POLL_INTERVAL}s — uploading to R2 bucket "
+             f"'{r2.R2_BUCKET}' under '{r2.R2_PREFIX}'")
 
     log.info("Seeding existing messages...")
     try:
@@ -513,9 +576,25 @@ def run():
         log.warning(f"Seed failed: {e}")
 
     consecutive_errors = 0
-    cookies_counter = 0
+    session_save_counter = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+
+        # Scheduled scraper runs in its own thread, queueing reels into the same
+        # download pool. Guard submit() against the executor shutting down.
+        def _scrape_submit(media, source_username: str) -> None:
+            if _shutdown.is_set():
+                return
+            try:
+                executor.submit(_safe_scrape_download, media, source_username, downloaded_urls)
+            except RuntimeError:
+                pass  # executor is shutting down
+
+        threading.Thread(
+            target=scraper.run_scraper, args=(cl, _scrape_submit, _shutdown),
+            daemon=True, name="scraper",
+        ).start()
+
         while not _shutdown.is_set():
             try:
                 raw_threads = fetch_threads_raw(cl)
@@ -549,10 +628,17 @@ def run():
                     save_json_set(SEEN_FILE, seen_ids)
 
                 consecutive_errors = 0
-                cookies_counter += 1
-                if cookies_counter >= 10:
-                    write_cookies(cl)
-                    cookies_counter = 0
+                # Persist the session periodically so Instagram's cookie/token
+                # rotation is captured — THIS is what keeps the login alive long
+                # term without ever re-pasting a sessionid.
+                session_save_counter += 1
+                if session_save_counter >= 20:
+                    try:
+                        cl.dump_settings(SESSION_FILE)
+                        log.info("Session persisted")
+                    except Exception as e:
+                        log.warning(f"Could not persist session: {e}")
+                    session_save_counter = 0
 
             except (RateLimitError, ClientThrottledError):
                 wait = min(300, 60 * (consecutive_errors + 1))
