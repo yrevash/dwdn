@@ -30,6 +30,7 @@ APIFY_ONGOING_LIMIT  = int(os.getenv("APIFY_ONGOING_LIMIT", "50"))     # per acc
 APIFY_INTERVAL       = int(os.getenv("APIFY_INTERVAL", "21600"))       # seconds between runs (6h)
 TARGETS_FILE         = Path(os.getenv("TARGETS_FILE", "targets.txt"))
 STATE_FILE           = Path(os.getenv("APIFY_STATE_FILE", "apify_state.json"))
+PENDING_FILE         = Path(os.getenv("APIFY_PENDING_FILE", "apify_pending.json"))
 
 
 def load_targets() -> list[str]:
@@ -62,6 +63,28 @@ def _save_state(s: dict) -> None:
         log.warning(f"could not save {STATE_FILE}: {e}")
 
 
+def _load_pending():
+    """A dataset already scraped from Apify but not yet fully processed."""
+    try:
+        return json.loads(PENDING_FILE.read_text())
+    except Exception:
+        return None
+
+
+def _save_pending(items) -> None:
+    try:
+        PENDING_FILE.write_text(json.dumps(items))
+    except Exception as e:
+        log.warning(f"could not save {PENDING_FILE}: {e}")
+
+
+def _clear_pending() -> None:
+    try:
+        PENDING_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _dataset_id(run):
     """apify-client returns a dict (older) or a pydantic Run object (2.x)."""
     if isinstance(run, dict):
@@ -83,57 +106,83 @@ def run_apify_scraper(shutdown) -> None:
     shutdown.wait(20)  # let login + DM seed settle first
 
     while not shutdown.is_set():
-        targets = load_targets()
-        if not targets:
-            log.info(f"No targets in {TARGETS_FILE} — re-checking in {APIFY_INTERVAL}s")
-            shutdown.wait(APIFY_INTERVAL)
-            continue
+        # 1) Prefer a dataset already scraped but not finished — costs NOTHING
+        #    (we only pay to RUN the actor, never to re-read a saved dataset).
+        pending = _load_pending()
 
-        state = _load_state()
-        backfilled = state.get("backfilled", False)
-        last_seen = state.get("last_seen")
+        if pending is None:
+            targets = load_targets()
+            if not targets:
+                log.info(f"No targets in {TARGETS_FILE} — re-checking in {APIFY_INTERVAL}s")
+                shutdown.wait(APIFY_INTERVAL)
+                continue
 
-        run_input = {
-            "username": targets,
-            "resultsLimit": APIFY_ONGOING_LIMIT if backfilled else APIFY_BACKFILL_LIMIT,
-            "skipPinnedPosts": False,
-            "includeDownloadedVideo": False,
-        }
-        # The actor rejects null — only include the date filter when we have one.
-        if backfilled and last_seen:
-            run_input["onlyPostsNewerThan"] = str(last_seen)
-        mode = "incremental" if backfilled else "BACKFILL"
-        log.info(f"Apify {mode} run: {len(targets)} account(s), "
-                 f"limit={run_input['resultsLimit']}/acct, newer_than={last_seen}")
+            state = _load_state()
+            backfilled = state.get("backfilled", False)
+            last_seen = state.get("last_seen")
 
-        try:
-            run = client.actor(APIFY_ACTOR).call(run_input=run_input)
-            ds_id = _dataset_id(run)
-        except Exception as e:
-            log.error(f"Apify run failed: {e} — retrying next cycle")
-            shutdown.wait(min(APIFY_INTERVAL, 1800))
-            continue
+            run_input = {
+                "username": targets,
+                "resultsLimit": APIFY_ONGOING_LIMIT if backfilled else APIFY_BACKFILL_LIMIT,
+                "skipPinnedPosts": False,
+                "includeDownloadedVideo": False,
+            }
+            # The actor rejects null — only include the date filter when we have one.
+            if backfilled and last_seen:
+                run_input["onlyPostsNewerThan"] = str(last_seen)
+            mode = "incremental" if backfilled else "BACKFILL"
+            log.info(f"Apify {mode} run: {len(targets)} account(s), "
+                     f"limit={run_input['resultsLimit']}/acct, newer_than={last_seen}")
+
+            try:
+                run = client.actor(APIFY_ACTOR).call(run_input=run_input)
+                pending = list(client.dataset(_dataset_id(run)).iterate_items())
+            except Exception as e:
+                log.error(f"Apify run failed: {e} — retrying next cycle")
+                shutdown.wait(min(APIFY_INTERVAL, 1800))
+                continue
+
+            _save_pending(pending)  # persist NOW so any restart resumes without re-charging
+            log.info(f"Apify returned {len(pending)} reels — saved to {PENDING_FILE}; "
+                     f"processing (restarts will NOT re-scrape)")
+        else:
+            log.info(f"Resuming {len(pending)} reels from {PENDING_FILE} — no Apify charge")
+
+        # 2) Process the saved dataset; dedup skips anything already uploaded, so a
+        #    resumed run just picks up where it left off.
+        downloaded = apify.load_downloaded()
+        newest = _load_state().get("last_seen")
+        for it in pending:
+            ts = it.get("timestamp")
+            if ts and (not newest or str(ts) > str(newest)):
+                newest = ts
 
         up = sk = fa = 0
-        newest = last_seen
-        try:
-            for item in client.dataset(ds_id).iterate_items():
-                if shutdown.is_set():
-                    break
+        interrupted = False
+        for item in pending:
+            if shutdown.is_set():
+                interrupted = True
+                break
+            try:
                 res = apify.download_reel(item, downloaded)
-                up += res == "uploaded"
-                sk += res == "skip"
-                fa += res == "fail"
-                ts = item.get("timestamp")
-                if ts and (not newest or str(ts) > str(newest)):
-                    newest = ts
-        except Exception as e:
-            log.error(f"Apify dataset processing error: {e}")
+            except Exception as e:
+                log.warning(f"reel failed: {e}")
+                res = "fail"
+            up += res == "uploaded"
+            sk += res == "skip"
+            fa += res == "fail"
 
+        if interrupted:
+            log.info(f"Stopped mid-batch — {PENDING_FILE} kept; will resume on restart (no re-charge)")
+            return
+
+        # 3) Whole dataset done → advance state and delete the local dataset.
         log.info(f"Apify cycle done: {up} uploaded, {sk} skipped (dupes), {fa} failed")
+        state = _load_state()
         state["backfilled"] = True
         if newest:
             state["last_seen"] = newest
         _save_state(state)
+        _clear_pending()
 
         shutdown.wait(APIFY_INTERVAL)

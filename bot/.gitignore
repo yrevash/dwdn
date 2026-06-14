@@ -8,6 +8,8 @@ downloaded_urls.json
 username_cache.json
 manifest.jsonl
 scrape_state.json
+apify_state.json
+apify_pending.json
 targets.txt
 ig_cookies.txt
 __pycache__/
