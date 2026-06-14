@@ -2,3 +2,4 @@ instagrapi
 boto3
 requests
 python-dotenv
+apify-client

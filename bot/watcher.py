@@ -580,19 +580,12 @@ def run():
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 
-        # Scheduled scraper runs in its own thread, queueing reels into the same
-        # download pool. Guard submit() against the executor shutting down.
-        def _scrape_submit(media, source_username: str) -> None:
-            if _shutdown.is_set():
-                return
-            try:
-                executor.submit(_safe_scrape_download, media, source_username, downloaded_urls)
-            except RuntimeError:
-                pass  # executor is shutting down
-
+        # Scheduled scraper: Apify scrapes Instagram (off our account) and returns
+        # video URLs; we download those → HEVC → R2. Zero ban risk on this path.
+        import apify_scraper
         threading.Thread(
-            target=scraper.run_scraper, args=(cl, _scrape_submit, _shutdown),
-            daemon=True, name="scraper",
+            target=apify_scraper.run_apify_scraper, args=(_shutdown,),
+            daemon=True, name="apify-scraper",
         ).start()
 
         while not _shutdown.is_set():
