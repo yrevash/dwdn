@@ -96,10 +96,12 @@ def run_apify_scraper(shutdown) -> None:
         run_input = {
             "username": targets,
             "resultsLimit": APIFY_ONGOING_LIMIT if backfilled else APIFY_BACKFILL_LIMIT,
-            "onlyPostsNewerThan": last_seen if backfilled else None,
             "skipPinnedPosts": False,
             "includeDownloadedVideo": False,
         }
+        # The actor rejects null — only include the date filter when we have one.
+        if backfilled and last_seen:
+            run_input["onlyPostsNewerThan"] = str(last_seen)
         mode = "incremental" if backfilled else "BACKFILL"
         log.info(f"Apify {mode} run: {len(targets)} account(s), "
                  f"limit={run_input['resultsLimit']}/acct, newer_than={last_seen}")

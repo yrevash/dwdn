@@ -52,6 +52,7 @@ IG_PASSWORD   = os.getenv("IG_PASSWORD", "")
 IG_PROXY      = os.getenv("IG_PROXY", "")
 IG_TOTP_SEED  = os.getenv("IG_TOTP_SEED", "")   # authenticator-app secret → auto 2FA codes
 IG_2FA_CODE   = os.getenv("IG_2FA_CODE", "")    # one-time 6-digit code (first-login fallback)
+DM_ENABLED    = os.getenv("DM_ENABLED", "true").lower() == "true"  # false = Apify-only, never touch the IG account
 DOWNLOAD_DIR  = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 MAX_WORKERS   = int(os.getenv("MAX_WORKERS", "3"))
@@ -536,8 +537,6 @@ def download_from_media(media, source_username: str, downloaded_urls: set) -> bo
 # ─── MAIN LOOP ─────────────────────────────────────────────────────────────────
 
 def run():
-    if not IG_USERNAME or not IG_PASSWORD:
-        raise RuntimeError("Set IG_USERNAME and IG_PASSWORD env vars")
     if not r2.is_configured():
         raise RuntimeError(
             "R2 not configured — set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, "
@@ -545,6 +544,26 @@ def run():
         )
 
     global _ig_client, _username_cache
+
+    # Apify scraper (account-free) runs regardless of DM mode.
+    import apify_scraper
+    threading.Thread(
+        target=apify_scraper.run_apify_scraper, args=(_shutdown,),
+        daemon=True, name="apify-scraper",
+    ).start()
+
+    # Apify-only mode — never log into / touch the Instagram account at all.
+    if not DM_ENABLED:
+        log.info("DM watcher DISABLED (DM_ENABLED=false) — Apify-only; the IG account is never used")
+        log.info(f"Uploading to R2 bucket '{r2.R2_BUCKET}' under '{r2.R2_PREFIX}'")
+        while not _shutdown.is_set():
+            _shutdown.wait(300)
+        log.info("Bot stopped.")
+        return
+
+    # ── DM watcher mode (the only part that uses the IG account) ──
+    if not IG_USERNAME or not IG_PASSWORD:
+        raise RuntimeError("Set IG_USERNAME and IG_PASSWORD (or set DM_ENABLED=false)")
 
     cl = make_client()
     login(cl)
@@ -579,15 +598,6 @@ def run():
     session_save_counter = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-
-        # Scheduled scraper: Apify scrapes Instagram (off our account) and returns
-        # video URLs; we download those → HEVC → R2. Zero ban risk on this path.
-        import apify_scraper
-        threading.Thread(
-            target=apify_scraper.run_apify_scraper, args=(_shutdown,),
-            daemon=True, name="apify-scraper",
-        ).start()
-
         while not _shutdown.is_set():
             try:
                 raw_threads = fetch_threads_raw(cl)
