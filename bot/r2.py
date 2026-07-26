@@ -71,18 +71,34 @@ def get_client():
 
 
 def upload(local_path: Path, filename: str, content_type: str = "video/mp4") -> str | None:
-    """Upload a file to R2 under the configured prefix. Returns the object key or None."""
+    """Upload a file to R2 under the configured prefix. Returns the object key or None.
+
+    Reads the file fully into memory and uploads it as a fixed byte buffer via
+    put_object (NOT the streaming transfer manager). This makes the payload hash
+    deterministic and re-usable across retries, which R2 needs — the transfer
+    manager's aws-chunked/streaming path triggers XAmzContentSHA256Mismatch and
+    'stream is not seekable' errors against R2.
+    """
     key = _prefix() + filename
     try:
-        get_client().upload_file(
-            str(local_path), R2_BUCKET, key,
-            ExtraArgs={"ContentType": content_type},
-        )
-        log.info(f"R2 uploaded: {R2_BUCKET}/{key}")
-        return key
-    except (BotoCoreError, ClientError) as e:
-        log.error(f"R2 upload failed for {filename}: {e}")
+        data = Path(local_path).read_bytes()
+    except OSError as e:
+        log.error(f"R2 upload failed for {filename}: cannot read {local_path}: {e}")
         return None
+
+    last = None
+    for attempt in range(1, 4):
+        try:
+            get_client().put_object(
+                Bucket=R2_BUCKET, Key=key, Body=data, ContentType=content_type,
+            )
+            log.info(f"R2 uploaded: {R2_BUCKET}/{key}")
+            return key
+        except (BotoCoreError, ClientError) as e:
+            last = e
+            log.warning(f"R2 upload attempt {attempt}/3 failed for {filename}: {e}")
+    log.error(f"R2 upload failed for {filename}: {last}")
+    return None
 
 
 def append_manifest(entry: dict) -> None:
@@ -99,9 +115,10 @@ def append_manifest(entry: dict) -> None:
             log.warning(f"manifest append failed: {e}")
             return
         try:
-            get_client().upload_file(
-                str(MANIFEST_FILE), R2_BUCKET, MANIFEST_KEY,
-                ExtraArgs={"ContentType": "application/x-ndjson"},
+            get_client().put_object(
+                Bucket=R2_BUCKET, Key=MANIFEST_KEY,
+                Body=MANIFEST_FILE.read_bytes(),
+                ContentType="application/x-ndjson",
             )
-        except (BotoCoreError, ClientError) as e:
+        except (BotoCoreError, ClientError, OSError) as e:
             log.warning(f"manifest mirror to R2 failed (kept locally): {e}")
