@@ -59,6 +59,12 @@ def get_client():
             config=Config(
                 signature_version="s3v4",
                 retries={"max_attempts": 5, "mode": "standard"},
+                # botocore >=1.36 defaults to adding an aws-chunked CRC32 trailer,
+                # which R2 rejects and which breaks on non-seekable stream rewinds
+                # ("Need to rewind the stream, but stream is not seekable").
+                # Only checksum when the operation actually requires it.
+                request_checksum_calculation="when_required",
+                response_checksum_validation="when_required",
             ),
         )
     return _client
