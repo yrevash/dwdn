@@ -51,6 +51,10 @@ YT_FORMAT    = os.getenv(
 )
 YT_DONE_FILE = Path(os.getenv("YT_DONE_FILE", "youtube_done.json"))
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
+# On datacenter IPs (cloud VMs) YouTube throws "Sign in to confirm you're not a
+# bot" — point YT_COOKIES at a Netscape cookies.txt exported from a logged-in
+# (ideally throwaway) YouTube account to authenticate every yt-dlp call.
+YT_COOKIES   = os.getenv("YT_COOKIES", "").strip()
 
 # Prefer the yt-dlp installed in THIS venv, fall back to PATH.
 _venv_bin = Path(sys.executable).parent
@@ -60,6 +64,14 @@ YTDLP = os.getenv("YTDLP_BIN") or (
 
 _shutdown = threading.Event()
 _done_lock = threading.Lock()
+
+
+def _yt(*args) -> list:
+    """Build a yt-dlp command, injecting --cookies when configured."""
+    base = [YTDLP]
+    if YT_COOKIES:
+        base += ["--cookies", YT_COOKIES]
+    return base + list(args)
 
 
 def _sanitize(name: str) -> str:
@@ -110,9 +122,9 @@ def list_channel(channel: str) -> list:
     A flat-playlist dump is one fast request; view_count is present for most
     channels. When it's missing we look it up per-video before deciding.
     """
-    entries = _run_json([
-        YTDLP, "--flat-playlist", "--dump-json", "--ignore-errors", channel,
-    ])
+    entries = _run_json(_yt(
+        "--flat-playlist", "--dump-json", "--ignore-errors", channel,
+    ))
     vids = []
     for e in entries:
         vid = e.get("id")
@@ -128,10 +140,10 @@ def list_channel(channel: str) -> list:
 
 
 def video_views(video_id: str):
-    objs = _run_json([
-        YTDLP, "-J", "--skip-download",
+    objs = _run_json(_yt(
+        "-J", "--skip-download",
         f"https://www.youtube.com/watch?v={video_id}",
-    ])
+    ))
     return objs[0].get("view_count") if objs else None
 
 
@@ -141,12 +153,12 @@ def download(video_id: str):
     # clear any stale partials for this id
     for p in DOWNLOAD_DIR.glob(f"yt_{video_id}.*"):
         p.unlink(missing_ok=True)
-    cmd = [
-        YTDLP, "-f", YT_FORMAT, "--merge-output-format", "mp4",
+    cmd = _yt(
+        "-f", YT_FORMAT, "--merge-output-format", "mp4",
         "--no-playlist", "--no-progress", "-o",
         str(DOWNLOAD_DIR / f"yt_{video_id}.%(ext)s"),
         f"https://www.youtube.com/watch?v={video_id}",
-    ]
+    )
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
     except Exception as e:
@@ -265,9 +277,14 @@ def main() -> None:
     if not r2.is_configured():
         raise SystemExit("R2 not configured — check R2_* vars in .env")
 
+    if not YT_COOKIES:
+        log.warning("YT_COOKIES not set — YouTube may reject datacenter IPs with "
+                    "'Sign in to confirm you're not a bot'. Set YT_COOKIES to a "
+                    "cookies.txt path if downloads fail.")
     log.info(f"YouTube->R2 mirror starting: channel={YT_CHANNEL}, "
              f"view_min={YT_VIEW_MIN}, transcode={'HEVC' if YT_TRANSCODE else 'off'}, "
-             f"prefix={YT_PREFIX}, every {YT_INTERVAL}s, yt-dlp={YTDLP}")
+             f"prefix={YT_PREFIX}, cookies={'yes' if YT_COOKIES else 'no'}, "
+             f"every {YT_INTERVAL}s, yt-dlp={YTDLP}")
 
     while not _shutdown.is_set():
         try:

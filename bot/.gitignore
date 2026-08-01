@@ -11,6 +11,7 @@ scrape_state.json
 apify_state.json
 apify_pending.json
 youtube_done.json
+yt_cookies.txt
 targets.txt
 ig_cookies.txt
 __pycache__/
