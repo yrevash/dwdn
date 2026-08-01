@@ -227,7 +227,12 @@ def sweep() -> None:
     if not vids:
         log.warning("channel returned 0 videos — check YT_CHANNEL / yt-dlp")
         return
-    log.info(f"channel has {len(vids)} videos; {len(done)} already mirrored")
+    # Most-popular first: mirror the highest-view videos before the rest.
+    # (Videos missing a flat view_count sort last but are still processed —
+    # their real view count is looked up per-video in process_video.)
+    vids.sort(key=lambda v: (v.get("view_count") or 0), reverse=True)
+    log.info(f"channel has {len(vids)} videos; {len(done)} already mirrored; "
+             f"processing most-viewed first")
 
     up = below = fail = skip = 0
     total = len(vids)
