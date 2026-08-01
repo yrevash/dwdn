@@ -70,16 +70,22 @@ def get_client():
     return _client
 
 
-def upload(local_path: Path, filename: str, content_type: str = "video/mp4") -> str | None:
-    """Upload a file to R2 under the configured prefix. Returns the object key or None.
+def upload(local_path: Path, filename: str, content_type: str = "video/mp4",
+           prefix: str | None = None) -> str | None:
+    """Upload a file to R2. Returns the object key or None.
 
-    Reads the file fully into memory and uploads it as a fixed byte buffer via
-    put_object (NOT the streaming transfer manager). This makes the payload hash
-    deterministic and re-usable across retries, which R2 needs — the transfer
-    manager's aws-chunked/streaming path triggers XAmzContentSHA256Mismatch and
-    'stream is not seekable' errors against R2.
+    `prefix` overrides the default R2_PREFIX (e.g. "youtube/" for the YouTube
+    mirror vs "reels/" for the Instagram reels). Reads the file fully into memory
+    and uploads it as a fixed byte buffer via put_object (NOT the streaming
+    transfer manager). This makes the payload hash deterministic and re-usable
+    across retries, which R2 needs — the transfer manager's aws-chunked/streaming
+    path triggers XAmzContentSHA256Mismatch and 'stream is not seekable' errors.
     """
-    key = _prefix() + filename
+    if prefix is None:
+        pfx = _prefix()
+    else:
+        pfx = prefix if (prefix == "" or prefix.endswith("/")) else prefix + "/"
+    key = pfx + filename
     try:
         data = Path(local_path).read_bytes()
     except OSError as e:

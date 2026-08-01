@@ -10,6 +10,7 @@ manifest.jsonl
 scrape_state.json
 apify_state.json
 apify_pending.json
+youtube_done.json
 targets.txt
 ig_cookies.txt
 __pycache__/
