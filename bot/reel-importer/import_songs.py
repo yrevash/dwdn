@@ -108,7 +108,12 @@ AUDIO_BITRATE        = os.getenv("AUDIO_BITRATE", "256k")
 VIDEO_CRF            = os.getenv("VIDEO_CRF", "20")
 VIDEO_HEIGHT         = os.getenv("VIDEO_HEIGHT", "720")
 VIDEO_PRESET         = os.getenv("VIDEO_PRESET", "veryslow")
-FFMPEG_TIMEOUT       = int(os.getenv("FFMPEG_TIMEOUT", "21600"))  # 6h: veryslow + AV1 decode
+# 18h. Sized off the actual catalogue, not a round number: at ~450kbps the largest
+# inbox file (367 MB) is ~1h48m of video, and at veryslow on a loaded 4-core box a
+# 19-minute source already takes ~90 minutes. The old 6h ceiling would have killed
+# the longest tracks after burning six hours on each — a silent failure that only
+# shows up as a "failed" count at the end.
+FFMPEG_TIMEOUT       = int(os.getenv("FFMPEG_TIMEOUT", "64800"))
 
 PLAN_ONLY   = os.getenv("PLAN_ONLY") == "1"
 MAX_COUNT   = int(os.getenv("MAX_COUNT", "0")) or None
