@@ -59,6 +59,12 @@ YT_COOKIES   = os.getenv("YT_COOKIES", "").strip()
 # deno) to solve YouTube's JS challenges; it's skipped unless enabled. Default
 # on; set YT_REMOTE_COMPONENTS="" to disable for an older yt-dlp that lacks it.
 YT_REMOTE_COMPONENTS = os.getenv("YT_REMOTE_COMPONENTS", "ejs:github").strip()
+# Pacing to avoid YouTube's volume-based bot flag (seconds). yt-dlp sleeps a
+# random YT_SLEEP_MIN..YT_SLEEP_MAX before each download and YT_SLEEP_REQUESTS
+# between data requests.
+YT_SLEEP_REQUESTS = os.getenv("YT_SLEEP_REQUESTS", "1")
+YT_SLEEP_MIN      = os.getenv("YT_SLEEP_MIN", "2")
+YT_SLEEP_MAX      = os.getenv("YT_SLEEP_MAX", "10")
 
 # Prefer the yt-dlp installed in THIS venv, fall back to PATH.
 _venv_bin = Path(sys.executable).parent
@@ -161,8 +167,10 @@ def download(video_id: str):
         p.unlink(missing_ok=True)
     cmd = _yt(
         "-f", YT_FORMAT, "--merge-output-format", "mp4",
-        "--no-playlist", "--no-progress", "-o",
-        str(DOWNLOAD_DIR / f"yt_{video_id}.%(ext)s"),
+        "--no-playlist", "--no-progress",
+        "--sleep-requests", YT_SLEEP_REQUESTS,
+        "--sleep-interval", YT_SLEEP_MIN, "--max-sleep-interval", YT_SLEEP_MAX,
+        "-o", str(DOWNLOAD_DIR / f"yt_{video_id}.%(ext)s"),
         f"https://www.youtube.com/watch?v={video_id}",
     )
     try:
