@@ -131,7 +131,16 @@ r2 = boto3.client(
     aws_access_key_id=R2_ACCESS_KEY_ID,
     aws_secret_access_key=R2_SECRET_ACCESS_KEY,
     region_name="auto",
-    config=Config(signature_version="s3v4", retries={"max_attempts": 5, "mode": "standard"}),
+    # max_pool_connections well above the default 10: each concurrent track runs a
+    # multipart download AND a multipart upload, both multi-threaded, so the default
+    # pool overflows and urllib3 logs "Connection pool is full, discarding connection"
+    # for the whole run. Harmless (the transfer retries on a fresh connection) but it
+    # churns sockets and buries real warnings in noise.
+    config=Config(
+        signature_version="s3v4",
+        retries={"max_attempts": 5, "mode": "standard"},
+        max_pool_connections=int(os.getenv("SONGS_POOL", "32")),
+    ),
 )
 
 PG_HEADERS = {
