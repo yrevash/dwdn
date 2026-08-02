@@ -373,14 +373,22 @@ def process(ytid: str, obj: dict) -> bool:
         "source_youtube_id": ytid,
     }
 
+    # `on_conflict=source_youtube_id` is required, not decorative: without it PostgREST
+    # infers the PRIMARY KEY as the arbiter, which never collides (fresh uuid per row), so
+    # a duplicate id escaped as a raw 23505 and failed the insert AFTER a 95-minute
+    # transcode had already been paid for. Seen live 2026-08-02 on NUBiYJcyg00.
     r = requests.post(
-        f"{SUPABASE_URL}/rest/v1/media",
+        f"{SUPABASE_URL}/rest/v1/media?on_conflict=source_youtube_id",
         headers={**PG_HEADERS, "Prefer": "resolution=ignore-duplicates,return=minimal"},
         json=[row], timeout=60,
     )
     if not r.ok:
         log.error(f"{ytid}: insert failed {r.status_code} {r.text[:300]}")
         return False
+    # A duplicate is now a no-op rather than an error, so the media it just uploaded is
+    # still live at the same keys — record it as done so a re-run does not redo the work.
+    if r.status_code == 409:
+        log.warning(f"{ytid}: row already existed — files uploaded, skipping insert")
 
     mark_done(ytid)
     log.info(f"{ytid}: done — {title[:60]}")
