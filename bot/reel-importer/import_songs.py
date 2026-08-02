@@ -55,6 +55,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -282,14 +283,24 @@ def upload(path: Path, key: str, content_type: str) -> str:
 
 def process(ytid: str, obj: dict) -> bool:
     key = obj["Key"]
+    t0 = time.monotonic()
+    # Stage logging matters more than it looks: ffmpeg runs at -loglevel error, so
+    # without these a 90-minute veryslow encode emits NOTHING between "start" and
+    # "done" and an operator cannot distinguish a working job from a hung one.
+    def stage(msg: str) -> None:
+        log.info(f"{ytid}: [{int(time.monotonic()-t0)//60}m] {msg}")
+
     log.info(f"{ytid}: start ({round(obj['Size']/1e6)} MB)")
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         src = tmp / "src.mp4"
         r2.download_file(SRC_BUCKET, key, str(src))
+        stage("downloaded")
 
         duration = probe_duration(src)
+        if duration:
+            stage(f"source is {duration//60}m{duration%60:02d}s — encoding audio")
 
         audio = tmp / "audio.m4a"
         if not run_ffmpeg(
@@ -299,6 +310,8 @@ def process(ytid: str, obj: dict) -> bool:
             f"{ytid} audio",
         ):
             return False
+        stage(f"audio done ({round(audio.stat().st_size/1e6,1)} MB) — encoding video "
+              f"({VIDEO_HEIGHT}p CRF{VIDEO_CRF} {VIDEO_PRESET}); this is the long one")
 
         video = tmp / "video.mp4"
         if not run_ffmpeg(
@@ -314,6 +327,7 @@ def process(ytid: str, obj: dict) -> bool:
             f"{ytid} video",
         ):
             return False
+        stage(f"video done ({round(video.stat().st_size/1e6,1)} MB)")
 
         thumb = tmp / "thumb.jpg"
         # A frame from ~15s in — the opening second is usually a title card or black.
@@ -329,6 +343,7 @@ def process(ytid: str, obj: dict) -> bool:
         stream_url = upload(audio, f"songs/{ytid}.m4a", "audio/mp4")
         video_url = upload(video, f"song-videos/{ytid}.mp4", "video/mp4")
         thumb_url = upload(thumb, f"songs_thumbnail/{ytid}.jpg", "image/jpeg") if thumb.exists() else None
+        stage("uploaded to CDN")
 
     meta = fetch_meta(ytid)
     # media_title_length caps title at 300 chars. These YouTube titles run long
