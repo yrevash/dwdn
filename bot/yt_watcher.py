@@ -55,6 +55,10 @@ DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
 # bot" — point YT_COOKIES at a Netscape cookies.txt exported from a logged-in
 # (ideally throwaway) YouTube account to authenticate every yt-dlp call.
 YT_COOKIES   = os.getenv("YT_COOKIES", "").strip()
+# Recent yt-dlp needs a downloadable "ejs" challenge-solver component (run via
+# deno) to solve YouTube's JS challenges; it's skipped unless enabled. Default
+# on; set YT_REMOTE_COMPONENTS="" to disable for an older yt-dlp that lacks it.
+YT_REMOTE_COMPONENTS = os.getenv("YT_REMOTE_COMPONENTS", "ejs:github").strip()
 
 # Prefer the yt-dlp installed in THIS venv, fall back to PATH.
 _venv_bin = Path(sys.executable).parent
@@ -69,6 +73,8 @@ _done_lock = threading.Lock()
 def _yt(*args) -> list:
     """Build a yt-dlp command, injecting --cookies when configured."""
     base = [YTDLP]
+    if YT_REMOTE_COMPONENTS:
+        base += ["--remote-components", YT_REMOTE_COMPONENTS]
     if YT_COOKIES:
         base += ["--cookies", YT_COOKIES]
     return base + list(args)
